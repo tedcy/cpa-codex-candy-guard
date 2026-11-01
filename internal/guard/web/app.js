@@ -1,8 +1,9 @@
 (() => {
   'use strict';
   const base = '/v0/management/plugins/cpa-codex-candy-guard';
+  const keyStore = 'cpa-codex-candy-guard.key';
   const $ = id => document.getElementById(id);
-  let key = '', state = null, dirty = false, pending = false, selected = new Set();
+  let key = '', authRevision = 0, state = null, dirty = false, pending = false, selected = new Set();
   const labels = { completed:'完成',partial:'部分结果',failed:'请求失败',cancelled:'已停止',skipped:'已跳过',unknown:'未确认',error:'异常',interrupted:'已中断',queued:'排队',running:'检测中',stopped:'已停止',paused:'已暂停' };
   const reasons = { disabled:'账号已禁用',cooldown:'冷却中',busy:'其他测试占用',unsupported_model:'不支持所选模型',identity_changed:'账号身份已变化',model_mismatch:'模型不一致',final_overload:'最终仍过载',ambiguous_records:'无法关联检测记录',record_timeout:'未取得本轮记录',dependency_error:'检测依赖异常',model_catalog_error:'模型目录读取失败',start_failed:'启动检测失败',start_not_confirmed:'启动未确认',record_read_error:'检测记录读取失败',invalid_record:'检测记录格式变化',invalid_record_status:'未知记录状态',stopped_before_action:'已停止自动关闭' };
   const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -11,7 +12,7 @@
       let raw = localStorage.getItem(name); if (!raw) return null;
       const prefix = /^enc::v([12])::/.exec(raw);
       if (prefix) {
-        const scope = prefix[1] === '2' ? 'v2|' + location.host : location.host + '|' + navigator.userAgent;
+        const scope = location.host + (prefix[1] === '1' ? '|' + navigator.userAgent : '');
         const secret = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + scope);
         raw = new TextDecoder().decode(Uint8Array.from(atob(raw.slice(prefix[0].length)), (c,i) => c.charCodeAt(0) ^ secret[i % secret.length]));
       }
@@ -20,8 +21,17 @@
   }
   function notice(message) { $('notice').textContent = message || ''; $('notice').hidden = !message; }
   async function api(path, method='GET', body) {
-    const response = await fetch(base + path, { method,cache:'no-store',signal:AbortSignal.timeout(120000),headers:{ Authorization:'Bearer '+key, ...(body === undefined ? {} : {'Content-Type':'application/json'}) },body:body === undefined ? undefined : JSON.stringify(body) });
-    if (response.status===401) { $('login').hidden=false; throw new Error('管理密钥无效或未登录'); }
+    if (!key) throw new Error('管理密钥无效或未登录');
+    const requestKey = key, revision = authRevision;
+    const response = await fetch(base + path, { method,cache:'no-store',signal:AbortSignal.timeout(120000),headers:{ Authorization:'Bearer '+requestKey, ...(body === undefined ? {} : {'Content-Type':'application/json'}) },body:body === undefined ? undefined : JSON.stringify(body) });
+    if (response.status===401) {
+      if (revision===authRevision && requestKey===key) {
+        key='';
+        try { sessionStorage.removeItem(keyStore); } catch {}
+        $('login').hidden=false;$('connection').textContent='未连接';$('connection').className='badge';
+      }
+      throw new Error('管理密钥无效或未登录');
+    }
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '请求失败'); return data;
   }
   function values() { return { model:$('model').value,per_credential_concurrency:Number($('per').value),credential_concurrency:Number($('global').value),interval_minutes:Number($('interval').value),schedule_enabled:$('scheduled').checked,scope:document.querySelector('[name=scope]:checked').value,credential_ids:[...selected] }; }
@@ -55,7 +65,18 @@
     $('history').innerHTML=state.rounds?.length?[...state.rounds].reverse().map(r=>`<details data-round="${escape(r.id)}" ${opened.has(r.id)?'open':''}><summary>${statusBadge(r.status)}<span>${escape(r.settings.model)}</span><small>${new Date(r.started).toLocaleString('zh-CN',{hour12:false})} · ${r.trigger==='timer'?'定时':'手动'} · ${r.items.filter(i=>i.action==='disabled').length} 已关闭</small></summary><div class="round-items"><table><thead><tr><th>账号</th><th>状态</th><th>归因模型</th><th>处理</th></tr></thead><tbody>${r.items.map(i=>`<tr><td class="account-name">${escape(i.name)}</td><td>${statusBadge(i.status,i.action)}</td><td>${escape(i.prediction || '—')}</td><td>${escape(actionText(i))}</td></tr>`).join('')}</tbody></table></div></details>`).join(''):'暂无运行记录';
     if (state.error) notice(state.error);
   }
-  async function refresh() { if (!key) return; try { state=await api('/state');$('login').hidden=true;render(); } catch(e) { $('connection').textContent='未连接';notice(e.message); } }
+  async function refresh() {
+    if (!key) return false;
+    const revision = authRevision;
+    try {
+      const updated = await api('/state');
+      if (revision!==authRevision || !key) return false;
+      state=updated;$('login').hidden=true;render();return true;
+    } catch(e) {
+      if (revision===authRevision) { $('connection').textContent='未连接';$('connection').className='badge';notice(e.message); }
+      return false;
+    }
+  }
   async function save() { await api('/settings','PUT',values());dirty=false;notice('设置已保存'); }
   $('settings').addEventListener('input',()=>{dirty=true;});
   $('settings').addEventListener('submit',async e=>{e.preventDefault();if(pending)return;pending=true;try{await save();await refresh();}catch(e){notice(e.message);}finally{pending=false;if(state)render();}});
@@ -65,8 +86,16 @@
   $('select-all').addEventListener('change',e=>{for(const c of state?.credentials || [])if(!c.disabled)e.target.checked?selected.add(c.id):selected.delete(c.id);dirty=true;render();});
   $('refresh').addEventListener('click',refresh);
   for(const id of ['accounts','history'])$(id+'-tab').addEventListener('click',()=>{for(const tab of ['accounts','history']){$(tab+'-tab').setAttribute('aria-selected',String(id===tab));$(tab+'-view').hidden=id!==tab;}});
-  $('login').addEventListener('submit',async e=>{e.preventDefault();key=$('key').value.trim();$('key').value='';await refresh();});
-  key=panelValue('cli-proxy-auth')?.state?.managementKey || '';
+  $('login').addEventListener('submit',async e=>{
+    e.preventDefault();key=$('key').value.trim();const revision=++authRevision;$('key').value='';
+    if (await refresh() && revision===authRevision && key) {
+      try { sessionStorage.setItem(keyStore,key); } catch {}
+      notice(state.error || '');
+    }
+  });
+  const panelKey=panelValue('cli-proxy-auth')?.state?.managementKey;
+  key=typeof panelKey==='string' ? panelKey.trim() : '';
+  if (!key) { try { key=(sessionStorage.getItem(keyStore) || '').trim(); } catch {} }
   if (!key)$('login').hidden=false;
   window.guardIcons();refresh();setInterval(()=>{if(!document.hidden&&!pending)refresh();},4000);
 })();
