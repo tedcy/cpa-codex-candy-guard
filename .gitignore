@@ -1,0 +1,14 @@
+/dist/
+/test-output/
+*.env
+*.log
+*.so
+*.h
+*.test
+/node_modules/
+/install-backup-*/
+__pycache__/
+*.py[cod]
+*.env.*
+/plugins/
+cpa-codex-candy-guard-state.json

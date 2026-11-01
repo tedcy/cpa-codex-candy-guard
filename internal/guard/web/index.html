@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 自动巡检</title><style>/*STYLES*/</style></head>
+<body>
+<header><div class="title"><span class="brand" data-icon="shield-check"></span><h1>Codex 自动巡检</h1><small>v0.1.0</small></div><div class="header-actions"><span id="connection" class="badge">连接中</span><button id="refresh" class="icon" title="刷新" aria-label="刷新"><span data-icon="refresh"></span></button></div></header>
+<main>
+<form id="login" hidden><label>管理密钥<input id="key" type="password" autocomplete="off" required></label><button type="submit"><span data-icon="login"></span>连接</button></form>
+<div id="notice" class="notice" role="status" hidden></div>
+<form id="settings">
+<div class="controls">
+<label class="model">模型<select id="model" required><option value="">选择模型</option></select></label>
+<label>每凭证并发<input id="per" type="number" min="1" max="3" value="3" required></label>
+<label title="同时检测的账号数；原检测插件的请求总并发上限为 6">同时检测账号数<input id="global" type="number" min="1" max="256" value="2" required></label>
+<label>间隔 / 分钟<input id="interval" type="number" min="1" max="525600" value="10" required></label>
+<label class="toggle-label"><span>定时模式</span><span class="switch"><input id="scheduled" type="checkbox" role="switch"><span class="track"></span></span></label>
+<button id="save" class="icon" type="submit" title="保存设置" aria-label="保存设置"><span data-icon="save"></span></button>
+</div>
+<div class="action-row"><div class="scope" role="group" aria-label="检测范围"><label><input type="radio" name="scope" value="all_enabled" checked>全部启用账号</label><label><input type="radio" name="scope" value="selected">已选账号 <span id="selected-count">0</span></label></div><div class="run-actions"><button id="stop" type="button" disabled><span data-icon="square"></span>停止</button><button id="run" class="primary" type="button"><span data-icon="play"></span>立即检测</button></div></div>
+</form>
+<section class="overview"><span id="account-count">账号 0</span><span id="enabled-count">启用 0</span><span id="round-state">待命</span><span class="next" id="next">定时关闭</span></section>
+<div class="tabs" role="tablist"><button id="accounts-tab" role="tab" aria-selected="true">账号</button><button id="history-tab" role="tab" aria-selected="false">运行记录</button></div>
+<section id="accounts-view" class="table-scroll"><table><thead><tr><th class="check"><input type="checkbox" id="select-all" aria-label="选择所有启用账号"></th><th>账号</th><th>账号状态</th><th>检测状态</th><th>归因模型</th><th>处理</th></tr></thead><tbody id="accounts"><tr><td colspan="6" class="empty">加载中</td></tr></tbody></table></section>
+<section id="history-view" hidden><div id="history" class="empty">暂无运行记录</div></section>
+</main><script>/*ICONS*/</script><script>/*APP*/</script></body></html>
