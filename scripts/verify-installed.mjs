@@ -1,4 +1,4 @@
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 import { readFile, writeFile } from 'node:fs/promises';
 const env = await readFile('D:/apps/cpa-usage-keeper/.env.docker','utf8');
 const key = env.split(/\r?\n/).find(line=>line.startsWith('CPA_MANAGEMENT_KEY=')).split('=').slice(1).join('=').trim().replace(/^["']|["']$/g,'');
@@ -7,11 +7,21 @@ const context = await browser.newContext({viewport:{width:1280,height:900}});
 const page = await context.newPage();
 const errors=[];page.on('pageerror',error=>errors.push(error.message));
 try {
+  const stateURL='http://127.0.0.1:18317/v0/management/plugins/cpa-codex-candy-guard/state';
+  const headers={Authorization:'Bearer '+key};
+  const before=await (await context.request.get(stateURL,{headers})).json();
   await page.goto('http://127.0.0.1:18317/v0/resource/plugins/cpa-codex-candy-guard/ui');
   await page.locator('#key').fill(key);await page.locator('#login button').click();
   await page.locator('#connection').filter({hasText:'已连接'}).waitFor();
   await page.locator('#accounts input[data-id]').first().waitFor();
-  if (await page.locator('#scheduled').isChecked()) throw new Error('Schedule must remain off');
+  await expect(page.locator('.title small')).toHaveText('v0.2.0');
+  if(before.settings.schedule_enabled||before.running)throw new Error('Verification requires an idle guard with its schedule off');
+  await page.reload();await expect(page.locator('#login')).toBeHidden();
+  await expect(page.locator('#connection')).toHaveText('已连接');
+  const cached=await page.evaluate(()=>Boolean(sessionStorage.getItem('cpa-codex-candy-guard.key')));
+  if(!cached)throw new Error('Temporary login was not preserved across reload');
+  await page.getByRole('radio',{name:'二次检查',exact:true}).check();
+  await expect(page.locator('#recheck-delay')).toBeVisible();
   await page.screenshot({path:'test-output/installed-desktop.png',fullPage:false,mask:[page.locator('.account-name')]});
   const accounts=await page.locator('#accounts input[data-id]').count();
   const models=await page.locator('#model option').count()-1;
@@ -19,7 +29,9 @@ try {
   await page.screenshot({path:'test-output/installed-mobile.png',fullPage:false,mask:[page.locator('.account-name')]});
   const layout=await page.evaluate(()=>({width:innerWidth,scroll:document.documentElement.scrollWidth}));
   if(layout.scroll>layout.width||errors.length)throw new Error('Layout or runtime validation failed');
-  const result={accounts,models,schedule_enabled:false,browser_errors:errors,desktop:'installed-desktop.png',mobile:'installed-mobile.png',read_only_verification:true};
+  const after=await (await context.request.get(stateURL,{headers})).json();
+  if(JSON.stringify(after.settings)!==JSON.stringify(before.settings)||after.rounds.length!==before.rounds.length)throw new Error('Read-only verification changed guard state');
+  const result={version:after.version,accounts,models,schedule_enabled:after.settings.schedule_enabled,recheck_enabled:after.settings.recheck_enabled,round_count:after.rounds.length,temporary_login_preserved:cached,browser_errors:errors,desktop:'installed-desktop.png',mobile:'installed-mobile.png',read_only_verification:true};
   await writeFile('test-output/installed-browser.json',JSON.stringify(result,null,2));
   console.log(JSON.stringify(result));
 }finally{await context.close();await browser.close();}

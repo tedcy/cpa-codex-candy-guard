@@ -2,6 +2,7 @@ package guard
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -9,7 +10,7 @@ import (
 
 const (
 	PluginID     = "cpa-codex-candy-guard"
-	Version      = "0.1.0"
+	Version      = "0.2.0"
 	CandyID      = "cpa-codex-candy-eval"
 	CandyVersion = "0.4.4"
 	APIBase      = "/v0/management/plugins/" + PluginID
@@ -28,12 +29,24 @@ type Settings struct {
 	Global          int      `json:"credential_concurrency"`
 	IntervalMinutes int      `json:"interval_minutes"`
 	Scheduled       bool     `json:"schedule_enabled"`
+	RecheckEnabled  bool     `json:"recheck_enabled"`
+	RecheckDelay    int      `json:"recheck_delay_minutes"`
 	Scope           string   `json:"scope"`
 	CredentialIDs   []string `json:"credential_ids"`
 }
 
 func DefaultSettings() Settings {
-	return Settings{PerCredential: 3, Global: 2, IntervalMinutes: 10, Scope: "all_enabled", CredentialIDs: []string{}}
+	return Settings{PerCredential: 3, Global: 2, IntervalMinutes: 10, RecheckDelay: 10, Scope: "all_enabled", CredentialIDs: []string{}}
+}
+
+func (s *Settings) UnmarshalJSON(raw []byte) error {
+	type settings Settings
+	decoded := settings{RecheckDelay: 10}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	*s = Settings(decoded)
+	return nil
 }
 
 func (s Settings) Validate() error {
@@ -48,6 +61,12 @@ func (s Settings) Validate() error {
 	}
 	if s.IntervalMinutes < 1 || s.IntervalMinutes > 525600 {
 		return errors.New("定时间隔须为 1–525600 分钟")
+	}
+	if s.RecheckDelay < 1 || s.RecheckDelay > 525600 {
+		return errors.New("复查间隔须为 1–525600 分钟")
+	}
+	if s.Scheduled && s.RecheckEnabled {
+		return errors.New("定时模式与二次检查模式不能同时启用")
 	}
 	if s.Scope != "all_enabled" && s.Scope != "selected" {
 		return errors.New("账号范围无效")
@@ -111,14 +130,16 @@ type Client interface {
 }
 
 type Item struct {
-	CredentialID string `json:"credential_id"`
-	Name         string `json:"name"`
-	Status       string `json:"status"`
-	Model        string `json:"model"`
-	Prediction   string `json:"prediction,omitempty"`
-	RecordID     string `json:"record_id,omitempty"`
-	Reason       string `json:"reason,omitempty"`
-	Action       string `json:"action,omitempty"`
+	CredentialID string     `json:"credential_id"`
+	Name         string     `json:"name"`
+	CheckIndex   int        `json:"check_index"`
+	DueAt        *time.Time `json:"due_at,omitempty"`
+	Status       string     `json:"status"`
+	Model        string     `json:"model"`
+	Prediction   string     `json:"prediction,omitempty"`
+	RecordID     string     `json:"record_id,omitempty"`
+	Reason       string     `json:"reason,omitempty"`
+	Action       string     `json:"action,omitempty"`
 }
 type Round struct {
 	ID       string     `json:"id"`

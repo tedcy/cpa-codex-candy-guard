@@ -110,6 +110,8 @@ type fakeClient struct {
 	active, peak int
 	automatic    bool
 	prediction   string
+	status       string
+	errorMessage string
 	startErr     bool
 	snapshotErr  bool
 	disableErr   bool
@@ -158,7 +160,11 @@ func (f *fakeClient) Start(_ context.Context, c Credential, s Settings) (StartAc
 	return StartAck{Started: 1}, nil
 }
 func (f *fakeClient) completeLocked(id, model string) {
-	r := Record{ID: fmt.Sprint(f.clock.Now().UnixNano()) + "-" + id, Time: f.clock.Now(), Model: model, Status: "completed", Attribution: &Attribution{Prediction: f.prediction}}
+	status := f.status
+	if status == "" {
+		status = "completed"
+	}
+	r := Record{ID: fmt.Sprint(f.clock.Now().UnixNano()) + "-" + id, Time: f.clock.Now(), Model: model, Status: status, Error: f.errorMessage, Attribution: &Attribution{Prediction: f.prediction}}
 	f.records[r.ID] = r
 	for i := range f.credentials {
 		if f.credentials[i].ID == id {
@@ -323,6 +329,9 @@ func TestScheduleWaitsAfterCompletionAndPersists(t *testing.T) {
 	s.Scheduled = true
 	s.IntervalMinutes = 2
 	if err := e.Settings(s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Start("manual"); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, func() bool { a, _, _ := c.counts(); return a == 1 })

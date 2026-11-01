@@ -21,7 +21,8 @@ OUT = SOURCE / "test-output"
 STAGE = OUT / "cpa-stage"
 STAGE_NAME = "cpa-candy-guard-stage"
 ID = "cpa-codex-candy-guard"
-BINARY = SOURCE / "dist" / (ID + "-v0.1.0.so")
+VERSION = "0.2.0"
+BINARY = SOURCE / "dist" / (ID + "-v" + VERSION + ".so")
 BASE = "http://127.0.0.1:18317"
 STAGE_BASE = "http://127.0.0.1:28318"
 KEY = next(line.split("=", 1)[1].strip().strip("\"'") for line in Path("D:/apps/cpa-usage-keeper/.env.docker").read_text(encoding="utf-8-sig").splitlines() if line.startswith("CPA_MANAGEMENT_KEY="))
@@ -72,15 +73,17 @@ def plugins(base):
 def verify(base):
     ps = plugins(base)
     guard = next(item for item in ps if item["id"] == ID)
-    if not guard["enabled"] or not guard["registered"] or guard["version"] != "0.1.0":
+    if not guard["enabled"] or not guard["registered"] or guard["version"] != VERSION:
         raise RuntimeError("Guard plugin registration failed")
     _, state = api(base, "/v0/management/plugins/" + ID + "/state")
     if state.get("error") or not state.get("ready") or state["settings"]["schedule_enabled"] or state["running"]:
         raise RuntimeError("Guard must be healthy and idle with its schedule off")
+    if "recheck_enabled" not in state["settings"] or state["settings"]["recheck_delay_minutes"] < 1:
+        raise RuntimeError("Second-check settings are missing or invalid")
     _, page = api(base, "/v0/resource/plugins/" + ID + "/ui")
-    if not isinstance(page, bytes) or "Codex 自动巡检".encode("utf-8") not in page:
+    if not isinstance(page, bytes) or "二次检查".encode("utf-8") not in page or ("v" + VERSION).encode("ascii") not in page:
         raise RuntimeError("Plugin UI did not render")
-    return {"plugins": ps, "guard_accounts": len(state["credentials"]), "guard_models": len(state["models"]), "schedule_enabled": state["settings"]["schedule_enabled"], "round_count": len(state.get("rounds", [])), "ui_bytes": len(page), "binary_sha256": digest(BINARY)}
+    return {"plugins": ps, "guard_accounts": len(state["credentials"]), "guard_models": len(state["models"]), "schedule_enabled": state["settings"]["schedule_enabled"], "recheck_enabled": state["settings"]["recheck_enabled"], "round_count": len(state.get("rounds", [])), "ui_bytes": len(page), "binary_sha256": digest(BINARY)}
 
 
 def wait_ready(base):
@@ -119,17 +122,20 @@ def stage():
     try:
         run(args + [inspect("cli-proxy-api")["image"], "/CLIProxyAPI/CLIProxyAPI", "-local-model"])
         result = wait_ready(STAGE_BASE)
-        settings = {"model": "gpt-6-astra", "per_credential_concurrency": 3, "credential_concurrency": 2, "interval_minutes": 10, "schedule_enabled": False, "scope": "all_enabled", "credential_ids": []}
-        api(STAGE_BASE, "/v0/management/plugins/" + ID + "/settings", settings, "PUT")
-        api(STAGE_BASE, "/v0/management/plugins/" + ID + "/run", {}, "POST")
-        for _ in range(20):
-            _, data = api(STAGE_BASE, "/v0/management/plugins/" + ID + "/state")
-            if not data["running"]:
-                break
-            time.sleep(0.1)
-        if data["rounds"][-1]["items"] != [] or data["running"]:
-            raise RuntimeError("Empty-account stage made unexpected work")
+        settings = {"model": "gpt-6-astra", "per_credential_concurrency": 3, "credential_concurrency": 2, "interval_minutes": 10, "schedule_enabled": False, "recheck_delay_minutes": 10, "scope": "all_enabled", "credential_ids": []}
+        for enabled in [False, True]:
+            settings["recheck_enabled"] = enabled
+            api(STAGE_BASE, "/v0/management/plugins/" + ID + "/settings", settings, "PUT")
+            api(STAGE_BASE, "/v0/management/plugins/" + ID + "/run", {}, "POST")
+            for _ in range(20):
+                _, data = api(STAGE_BASE, "/v0/management/plugins/" + ID + "/state")
+                if not data["running"]:
+                    break
+                time.sleep(0.1)
+            if data["rounds"][-1]["items"] != [] or data["running"]:
+                raise RuntimeError("Empty-account stage made unexpected work")
         result["empty_account_run"] = "completed_without_requests"
+        result["empty_account_recheck"] = "completed_without_requests"
         (OUT / "stage-verification.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         emit(result)
     finally:
@@ -250,36 +256,110 @@ def install():
         emit(result)
 
 
+def idle_guard(wait=False):
+    deadline = time.monotonic() + (600 if wait else 0)
+    while True:
+        _, state = api(BASE, "/v0/management/plugins/" + ID + "/state")
+        _, original = api(BASE, "/v0/management/plugins/cpa-codex-candy-eval/state")
+        if state["settings"]["schedule_enabled"]:
+            raise RuntimeError("Disable the guard schedule before updating")
+        active = sum(bool(c.get("running")) for c in original["credentials"])
+        if not state["running"] and active == 0:
+            return state
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Existing tests are still running; update postponed")
+        emit({"waiting_for_existing_tests": active, "guard_running": state["running"]})
+        time.sleep(10)
+
+
 def update_binary():
     expected = json.loads((OUT / "stage-verification.json").read_text())
     if expected["binary_sha256"] != digest(BINARY):
         raise RuntimeError("Updated binary must pass stage verification")
-    _, state = api(BASE, "/v0/management/plugins/" + ID + "/state")
-    _, original = api(BASE, "/v0/management/plugins/cpa-codex-candy-eval/state")
-    if state["running"] or state["settings"]["schedule_enabled"] or any(c.get("running") for c in original["credentials"]):
-        raise RuntimeError("Existing tests or guard schedule must be idle before binary update")
-    target = LOCAL / "plugins/linux/amd64" / BINARY.name
+    state = idle_guard(wait=True)
+    original_plugins = plugins(BASE)
+    keeper = inspect("cpa-usage-keeper")
+    cpa = inspect("cli-proxy-api")
+    plugin_root = (LOCAL / "plugins").resolve()
+    binary_dir = plugin_root / "linux/amd64"
+    old_binaries = list(binary_dir.glob(ID + "*.so"))
+    target = binary_dir / BINARY.name
+    pending = target.with_suffix(".pending")
+    state_path = plugin_root / (ID + "-state.json")
+    if not plugin_root.is_relative_to(LOCAL.resolve()) or any(not p.resolve().is_relative_to(plugin_root) for p in [binary_dir, target, pending, state_path, *old_binaries]):
+        raise RuntimeError("Plugin paths must stay inside the local CPA plugin directory")
+    if len(old_binaries) != 1 or target.exists() or pending.exists():
+        raise RuntimeError("Expected one previous guard library and no new-version library")
     backup = SOURCE / ("install-backup-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-binary")
     backup.mkdir()
-    shutil.copy2(target, backup / target.name)
+    for name in ["config.yaml", "docker-compose.yml"]:
+        shutil.copy2(LOCAL / name, backup / name)
+    shutil.copytree(plugin_root, backup / "plugins")
     config_hash = digest(LOCAL / "config.yaml")
     compose_hash = digest(LOCAL / "docker-compose.yml")
     result = {"status": "starting", "backup": str(backup)}
+    touched = False
     try:
+        latest = idle_guard()
+        if latest["settings"] != state["settings"] or len(latest["rounds"]) != len(state["rounds"]):
+            raise RuntimeError("Guard settings or history changed during preparation")
         run(["docker", "stop", "--time", "20", "cli-proxy-api"])
-        shutil.copy2(BINARY, target.with_suffix(".pending"))
-        target.with_suffix(".pending").replace(target)
+        touched = True
+        if state_path.exists():
+            shutil.copy2(state_path, backup / "plugins" / state_path.name)
+        shutil.copy2(BINARY, pending)
+        pending.replace(target)
+        for old in old_binaries:
+            old.unlink()
         run(["docker", "start", "cli-proxy-api"])
-        result.update(status="success", verification=wait_ready(BASE))
+        verification = wait_ready(BASE)
         if digest(LOCAL / "config.yaml") != config_hash or digest(LOCAL / "docker-compose.yml") != compose_hash:
             raise RuntimeError("Configuration changed during binary update")
+        current_plugins = {p["id"]: p for p in verification["plugins"]}
+        for old in original_plugins:
+            if old["id"] != ID and current_plugins.get(old["id"]) != old:
+                raise RuntimeError("An existing plugin changed")
+        _, after = api(BASE, "/v0/management/plugins/" + ID + "/state")
+        old_settings = dict(state["settings"])
+        old_settings.setdefault("recheck_enabled", False)
+        old_settings.setdefault("recheck_delay_minutes", 10)
+        if after["settings"] != old_settings or [r["id"] for r in after["rounds"]] != [r["id"] for r in state["rounds"]]:
+            raise RuntimeError("Guard settings or history were not preserved")
+        if {c["id"]: c["disabled"] for c in after["credentials"]} != {c["id"]: c["disabled"] for c in state["credentials"]}:
+            raise RuntimeError("Credential status changed during upgrade")
+        verification["keeper"] = inspect("cpa-usage-keeper")
+        verification["cpa"] = inspect("cli-proxy-api")
+        if verification["keeper"]["id"] != keeper["id"] or verification["keeper"]["health"] != "healthy" or verification["cpa"]["id"] != cpa["id"]:
+            raise RuntimeError("CPA container identity or Keeper health changed")
+        verification.update(existing_plugins_unchanged=True, settings_history_preserved=True, credential_status_preserved=True, config_compose_unchanged=True)
+        result.update(status="success", verification=verification)
     except Exception as error:
-        run(["docker", "stop", "--time", "15", "cli-proxy-api"], check=False)
-        shutil.copy2(backup / target.name, target)
-        run(["docker", "start", "cli-proxy-api"])
-        result.update(status="rolled_back", error_type=type(error).__name__)
+        result.update(status="failed", error_type=type(error).__name__)
+        if touched:
+            run(["docker", "stop", "--time", "15", "cli-proxy-api"], check=False)
+            if target.exists():
+                target.unlink()
+            for old in old_binaries:
+                shutil.copy2(backup / "plugins/linux/amd64" / old.name, old)
+            old_state = backup / "plugins" / state_path.name
+            if old_state.exists():
+                shutil.copy2(old_state, state_path)
+            elif state_path.exists():
+                state_path.unlink()
+            run(["docker", "start", "cli-proxy-api"])
+            for _ in range(30):
+                try:
+                    if plugins(BASE) == original_plugins:
+                        result["status"] = "rolled_back"
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
     (OUT / "binary-update-result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    (backup / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     emit(result)
+    if result["status"] != "success":
+        raise RuntimeError("Guard update did not complete; inspect the private update result")
 
 
 parser = argparse.ArgumentParser()

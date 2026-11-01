@@ -36,6 +36,7 @@ type Engine struct {
 	storageFault string
 	next         *time.Time
 	timer        Timer
+	wake         chan struct{}
 	generation   uint64
 	sequence     uint64
 	ctx          context.Context
@@ -76,6 +77,13 @@ func NewEngine(client Client, path string, options Options) (*Engine, error) {
 		if json.Unmarshal(raw, &e.data) != nil || e.data.Version != 1 {
 			cancel()
 			return nil, errors.New("巡检状态文件不兼容，未覆盖原文件")
+		}
+		for i := range e.data.Rounds {
+			for j := range e.data.Rounds[i].Items {
+				if e.data.Rounds[i].Items[j].CheckIndex == 0 {
+					e.data.Rounds[i].Items[j].CheckIndex = 1
+				}
+			}
 		}
 		if err = e.data.Settings.Validate(); err != nil {
 			cancel()
@@ -128,6 +136,7 @@ func (e *Engine) persistLocked() error {
 		e.fault = e.storageFault
 		e.stopping = true
 		e.clearTimerLocked()
+		e.signalWake(e.wake)
 		return errors.New(e.storageFault)
 	}
 	return nil
@@ -172,23 +181,20 @@ func (e *Engine) Settings(s Settings) error {
 		e.mu.Unlock()
 		return errors.New("插件正在停止")
 	}
-	wasScheduled := e.data.Settings.Scheduled
+	hadTimer := e.timer != nil
 	e.data.Settings = s
 	if err := e.persistLocked(); err != nil {
 		e.mu.Unlock()
 		return err
 	}
-	if !s.Scheduled {
+	if e.active != "" {
+		e.updateNextLocked(e.active)
+	} else if !s.Scheduled {
 		e.clearTimerLocked()
-	} else if wasScheduled {
+	} else if hadTimer {
 		e.scheduleLocked()
 	}
-	start := s.Scheduled && !wasScheduled && e.active == "" && !e.starting
 	e.mu.Unlock()
-	if start {
-		_, err := e.Start("timer")
-		return err
-	}
 	return nil
 }
 
@@ -247,7 +253,7 @@ func (e *Engine) Start(trigger string) (string, error) {
 		if s.Scope == "selected" && !slices.Contains(s.CredentialIDs, cred.ID) {
 			continue
 		}
-		item := Item{CredentialID: cred.ID, Name: cred.Name, Model: s.Model, Status: "queued"}
+		item := Item{CredentialID: cred.ID, Name: cred.Name, CheckIndex: 1, Model: s.Model, Status: "queued"}
 		switch {
 		case cred.Disabled:
 			item.Status = "skipped"
@@ -265,12 +271,15 @@ func (e *Engine) Start(trigger string) (string, error) {
 	}
 	e.data.Rounds = append(e.data.Rounds, round)
 	e.active = id
+	wake := make(chan struct{}, 1)
+	e.wake = wake
 	if err = e.persistLocked(); err != nil {
 		e.active = ""
+		e.wake = nil
 		return "", err
 	}
 	e.wg.Add(1)
-	go e.runRound(id, s, queue)
+	go e.runRound(id, s, queue, wake)
 	return id, nil
 }
 
@@ -282,7 +291,36 @@ func (e *Engine) currentLocked(id string) *Round {
 	}
 	return nil
 }
-func (e *Engine) setItem(id, credentialID string, update func(*Item)) error {
+func itemCheckIndex(item Item) int {
+	if item.CheckIndex <= 0 {
+		return 1
+	}
+	return item.CheckIndex
+}
+
+func (e *Engine) updateNextLocked(id string) {
+	if e.active != id {
+		return
+	}
+	var next *time.Time
+	if r := e.currentLocked(id); r != nil {
+		for _, item := range r.Items {
+			if itemCheckIndex(item) != 2 || item.Status != "queued" || item.DueAt == nil {
+				continue
+			}
+			if next == nil || item.DueAt.Before(*next) {
+				at := *item.DueAt
+				next = &at
+			}
+		}
+	}
+	e.next = next
+}
+
+func (e *Engine) setItem(id, credentialID string, checkIndex int, update func(*Item)) error {
+	if checkIndex <= 0 {
+		checkIndex = 1
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r := e.currentLocked(id)
@@ -290,12 +328,41 @@ func (e *Engine) setItem(id, credentialID string, update func(*Item)) error {
 		return errors.New("巡检轮次已不存在")
 	}
 	for i := range r.Items {
-		if r.Items[i].CredentialID == credentialID {
+		if r.Items[i].CredentialID == credentialID && itemCheckIndex(r.Items[i]) == checkIndex {
 			update(&r.Items[i])
+			e.updateNextLocked(id)
 			return e.persistLocked()
 		}
 	}
 	return errors.New("巡检账号已不存在")
+}
+
+func (e *Engine) addRecheck(id string, credential Credential, model string, due time.Time) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r := e.currentLocked(id)
+	if r == nil || e.closed || e.stopping || e.active != id || e.fault != "" {
+		return false
+	}
+	for _, item := range r.Items {
+		if item.CredentialID == credential.ID && itemCheckIndex(item) == 2 {
+			return false
+		}
+	}
+	dueCopy := due
+	r.Items = append(r.Items, Item{CredentialID: credential.ID, Name: credential.Name, CheckIndex: 2, DueAt: &dueCopy, Model: model, Status: "queued"})
+	e.updateNextLocked(id)
+	return e.persistLocked() == nil
+}
+
+func (e *Engine) signalWake(wake chan struct{}) {
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
 }
 func (e *Engine) halted(id string) bool {
 	e.mu.Lock()
@@ -304,36 +371,135 @@ func (e *Engine) halted(id string) bool {
 }
 func (e *Engine) pause() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.fault = "检测依赖异常或结果格式变化，已暂停自动关闭"
 	e.stopping = true
 	e.clearTimerLocked()
+	wake := e.wake
+	e.mu.Unlock()
+	e.signalWake(wake)
 }
 
-func (e *Engine) runRound(id string, s Settings, queue []Credential) {
-	defer e.wg.Done()
-	jobs := make(chan Credential, len(queue))
-	for _, cred := range queue {
-		jobs <- cred
+type checkTask struct {
+	credential Credential
+	checkIndex int
+	due        time.Time
+}
+
+type checkResult struct {
+	task            checkTask
+	scheduleRecheck bool
+	finished        time.Time
+}
+
+func (e *Engine) cancelPending(id string, tasks []checkTask) {
+	status := "cancelled"
+	if e.ctx.Err() != nil {
+		status = "interrupted"
 	}
-	close(jobs)
-	var workers sync.WaitGroup
-	for range min(s.Global, len(queue)) {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for cred := range jobs {
-				if e.halted(id) {
-					_ = e.setItem(id, cred.ID, func(item *Item) { item.Status = "cancelled" })
-					continue
-				}
-				e.runCredential(id, s, cred)
+	for _, task := range tasks {
+		_ = e.setItem(id, task.credential.ID, task.checkIndex, func(item *Item) {
+			if item.Status == "queued" {
+				item.Status = status
+				item.Reason = "stopped_before_start"
 			}
-		}()
+		})
 	}
-	workers.Wait()
+}
+
+func (e *Engine) runRound(id string, s Settings, queue []Credential, wake chan struct{}) {
+	defer e.wg.Done()
+	first := make([]checkTask, 0, len(queue))
+	for _, cred := range queue {
+		first = append(first, checkTask{credential: cred, checkIndex: 1})
+	}
+	var rechecks []checkTask
+	done := make(chan checkResult, max(1, s.Global))
+	running := 0
+
+	for {
+		stopped := e.halted(id)
+		if stopped {
+			e.cancelPending(id, first)
+			e.cancelPending(id, rechecks)
+			first = nil
+			rechecks = nil
+		}
+
+		launched := false
+		for running < s.Global && !stopped {
+			var task checkTask
+			haveTask := false
+			if len(first) > 0 {
+				task, first = first[0], first[1:]
+				haveTask = true
+			} else if len(rechecks) > 0 && !rechecks[0].due.After(e.clock.Now()) {
+				task, rechecks = rechecks[0], rechecks[1:]
+				haveTask = true
+			}
+			if !haveTask {
+				break
+			}
+			running++
+			launched = true
+			go func(task checkTask) {
+				recheck := e.runCredential(id, s, task.credential, task.checkIndex)
+				done <- checkResult{task: task, scheduleRecheck: recheck, finished: e.clock.Now()}
+			}(task)
+		}
+		if running == 0 && len(first) == 0 && len(rechecks) == 0 {
+			break
+		}
+		if launched {
+			continue
+		}
+
+		var timer Timer
+		var timerCh <-chan struct{}
+		if !stopped && running < s.Global && len(first) == 0 && len(rechecks) > 0 {
+			delay := rechecks[0].due.Sub(e.clock.Now())
+			if delay <= 0 {
+				continue
+			}
+			ch := make(chan struct{}, 1)
+			timer = e.clock.AfterFunc(delay, func() {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			})
+			if !rechecks[0].due.After(e.clock.Now()) {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+			timerCh = ch
+		}
+		ctxDone := e.ctx.Done()
+		if stopped {
+			ctxDone = nil
+		}
+
+		select {
+		case result := <-done:
+			running--
+			if result.scheduleRecheck && !e.halted(id) {
+				due := result.finished.Add(time.Duration(s.RecheckDelay) * time.Minute)
+				if e.addRecheck(id, result.task.credential, s.Model, due) {
+					rechecks = append(rechecks, checkTask{credential: result.task.credential, checkIndex: 2, due: due})
+					sort.SliceStable(rechecks, func(i, j int) bool { return rechecks[i].due.Before(rechecks[j].due) })
+				}
+			}
+		case <-wake:
+		case <-ctxDone:
+		case <-timerCh:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if r := e.currentLocked(id); r != nil {
 		now := e.clock.Now()
 		r.Finished = &now
@@ -347,10 +513,15 @@ func (e *Engine) runRound(id string, s Settings, queue []Credential) {
 			r.Status = "paused"
 		}
 	}
+	e.next = nil
 	e.active = ""
 	e.stopping = false
+	if e.wake == wake {
+		e.wake = nil
+	}
 	_ = e.persistLocked()
 	e.scheduleLocked()
+	e.mu.Unlock()
 }
 
 func findCredential(snapshot Snapshot, id string) (Credential, bool) {
@@ -362,42 +533,46 @@ func findCredential(snapshot Snapshot, id string) (Credential, bool) {
 	return Credential{}, false
 }
 
-func (e *Engine) runCredential(roundID string, s Settings, original Credential) {
+func (e *Engine) runCredential(roundID string, s Settings, original Credential, checkIndex int) bool {
 	finish := func(status, reason string) {
-		_ = e.setItem(roundID, original.ID, func(item *Item) { item.Status = status; item.Reason = reason })
+		_ = e.setItem(roundID, original.ID, checkIndex, func(item *Item) { item.Status = status; item.Reason = reason })
+	}
+	if e.halted(roundID) {
+		finish("cancelled", "stopped_before_start")
+		return false
 	}
 	snapshot, err := e.client.Snapshot(e.ctx)
 	if err != nil {
 		e.pause()
 		finish("error", "dependency_error")
-		return
+		return false
 	}
 	cred, ok := findCredential(snapshot, original.ID)
 	if !ok || cred.Name != original.Name || cred.AuthIndex != original.AuthIndex || cred.Email != original.Email {
 		finish("skipped", "identity_changed")
-		return
+		return false
 	}
 	if cred.Disabled {
 		finish("skipped", "disabled")
-		return
+		return false
 	}
 	if cred.Unavailable {
 		finish("skipped", "cooldown")
-		return
+		return false
 	}
 	if cred.Running != nil {
 		finish("skipped", "busy")
-		return
+		return false
 	}
 	models, err := e.client.Models(e.ctx, cred)
 	if err != nil {
 		e.pause()
 		finish("error", "model_catalog_error")
-		return
+		return false
 	}
 	if !slices.Contains(models, s.Model) {
 		finish("skipped", "unsupported_model")
-		return
+		return false
 	}
 	known := map[string]bool{}
 	for _, r := range cred.Records {
@@ -407,18 +582,18 @@ func (e *Engine) runCredential(roundID string, s Settings, original Credential) 
 	e.actionMu.Lock()
 	if e.halted(roundID) {
 		e.actionMu.Unlock()
-		finish("cancelled", "")
-		return
+		finish("cancelled", "stopped_before_start")
+		return false
 	}
-	if err = e.setItem(roundID, cred.ID, func(item *Item) { item.Status = "running" }); err != nil {
+	if err = e.setItem(roundID, cred.ID, checkIndex, func(item *Item) { item.Status = "running" }); err != nil {
 		e.actionMu.Unlock()
-		return
+		return false
 	}
 	ack, err := e.client.Start(e.ctx, cred, s)
 	e.actionMu.Unlock()
 	if err != nil {
 		finish("error", "start_failed")
-		return
+		return false
 	}
 	if ack.Started != 1 {
 		if ack.Busy > 0 {
@@ -428,27 +603,27 @@ func (e *Engine) runCredential(roundID string, s Settings, original Credential) 
 		} else {
 			finish("error", "start_not_confirmed")
 		}
-		return
+		return false
 	}
 	for {
 		if e.ctx.Err() != nil {
 			finish("interrupted", "")
-			return
+			return false
 		}
 		if e.clock.Now().Sub(submitted) > e.recordWait {
 			finish("unknown", "record_timeout")
-			return
+			return false
 		}
 		snapshot, err = e.client.Snapshot(e.ctx)
 		if err != nil {
 			e.pause()
 			finish("error", "dependency_error")
-			return
+			return false
 		}
 		fresh, exists := findCredential(snapshot, cred.ID)
 		if !exists || fresh.AuthIndex != cred.AuthIndex || fresh.Email != cred.Email {
 			finish("unknown", "identity_changed")
-			return
+			return false
 		}
 		candidates := []Record{}
 		for _, r := range fresh.Records {
@@ -458,38 +633,37 @@ func (e *Engine) runCredential(roundID string, s Settings, original Credential) 
 		}
 		if len(candidates) > 1 {
 			finish("unknown", "ambiguous_records")
-			return
+			return false
 		}
 		if len(candidates) == 1 {
 			summary := candidates[0]
 			if summary.ID == "" || summary.Time.IsZero() {
 				e.pause()
 				finish("error", "invalid_record")
-				return
+				return false
 			}
 			record, err := e.client.Detail(e.ctx, cred.ID, summary.ID)
 			if err != nil {
 				e.pause()
 				finish("error", "record_read_error")
-				return
+				return false
 			}
 			if record.ID != summary.ID || !record.Time.Equal(summary.Time) || record.Model != s.Model {
-				e.pause()
 				finish("unknown", "ambiguous_records")
-				return
+				return false
 			}
 			if !slices.Contains([]string{"completed", "partial", "failed", "cancelled", "skipped"}, record.Status) {
 				e.pause()
 				finish("error", "invalid_record_status")
-				return
+				return false
 			}
 			if record.Attribution != nil && !slices.Contains([]string{"", "partial", "not_model"}, record.Attribution.Decision) {
 				e.pause()
 				finish("error", "invalid_record")
-				return
+				return false
 			}
 			verdict := Judge(record)
-			_ = e.setItem(roundID, cred.ID, func(item *Item) {
+			_ = e.setItem(roundID, cred.ID, checkIndex, func(item *Item) {
 				item.RecordID = record.ID
 				item.Status = record.Status
 				if record.Attribution != nil {
@@ -497,28 +671,28 @@ func (e *Engine) runCredential(roundID string, s Settings, original Credential) 
 				}
 			})
 			if !verdict.Disable {
-				return
+				return checkIndex == 1 && s.RecheckEnabled && slices.Contains([]string{"completed", "partial", "failed"}, record.Status) && !e.halted(roundID)
 			}
 			// Stop and disable are serialized; once Stop returns, no new disable can begin.
 			e.actionMu.Lock()
 			if e.halted(roundID) {
 				e.actionMu.Unlock()
 				finish("cancelled", "stopped_before_action")
-				return
+				return false
 			}
-			err = e.setItem(roundID, cred.ID, func(item *Item) { item.Reason = verdict.Reason; item.Action = "disable_pending" })
+			err = e.setItem(roundID, cred.ID, checkIndex, func(item *Item) { item.Reason = verdict.Reason; item.Action = "disable_pending" })
 			if err == nil {
 				err = e.client.Disable(e.ctx, cred)
 			}
 			e.actionMu.Unlock()
-			_ = e.setItem(roundID, cred.ID, func(item *Item) {
+			_ = e.setItem(roundID, cred.ID, checkIndex, func(item *Item) {
 				if err != nil {
 					item.Action = "disable_failed"
 				} else {
 					item.Action = "disabled"
 				}
 			})
-			return
+			return false
 		}
 		tick := make(chan struct{}, 1)
 		timer := e.clock.AfterFunc(e.poll, func() { tick <- struct{}{} })
@@ -526,7 +700,7 @@ func (e *Engine) runCredential(roundID string, s Settings, original Credential) 
 		case <-e.ctx.Done():
 			timer.Stop()
 			finish("interrupted", "")
-			return
+			return false
 		case <-tick:
 		}
 	}
@@ -534,11 +708,13 @@ func (e *Engine) runCredential(roundID string, s Settings, original Credential) 
 
 func (e *Engine) Stop() {
 	e.actionMu.Lock()
-	defer e.actionMu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.stopping = e.active != "" || e.starting
 	_ = e.persistLocked()
+	wake := e.wake
+	e.mu.Unlock()
+	e.actionMu.Unlock()
+	e.signalWake(wake)
 }
 
 func (e *Engine) View(ctx context.Context) View {
